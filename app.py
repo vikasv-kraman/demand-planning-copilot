@@ -231,14 +231,20 @@ def chart_weekly(df, sku):
     fig.add_trace(go.Scatter(x=hist["week"],y=hist["actual_qty"],name="Actual",mode="lines+markers",line=dict(color="#2d9cdb",width=2.5),marker=dict(size=5)))
     if not fcast.empty:
         fig.add_trace(go.Scatter(x=fcast["week"],y=fcast["forecast_qty"],name="Future Forecast",mode="lines+markers",line=dict(color="#fbbf24",width=2,dash="dot"),marker=dict(size=5,symbol="diamond")))
-    # On Order — separate line (visible on future weeks when orders exist)
+    # On Hand — physical stock on shelf
+    on_hand_col = pd.to_numeric(d["on_hand_qty"], errors="coerce").fillna(0)
+    fig.add_trace(go.Scatter(x=d["week"], y=on_hand_col,
+        name="On Hand", mode="lines+markers",
+        line=dict(color="#f97316", width=1.8, dash="dot"),
+        marker=dict(size=4, color="#f97316")))
+    # On Order — open POs in pipeline
     on_order_col = pd.to_numeric(d["on_order_qty"], errors="coerce").fillna(0)
     if on_order_col.sum() > 0:
         fig.add_trace(go.Scatter(x=d["week"], y=on_order_col,
             name="On Order", mode="lines+markers",
             line=dict(color="#a78bfa", width=1.8, dash="dot"),
             marker=dict(size=4, color="#a78bfa")))
-    # ATS = on_hand + on_order
+    # ATS = on_hand + on_order (total available)
     fig.add_trace(go.Scatter(x=d["week"],y=d["ats"],name="Avail. to Supply",mode="lines",
         line=dict(color="#4ade80",width=2),fill="tozeroy",fillcolor="rgba(74,222,128,0.06)"))
     # Safety stock line with number label
@@ -283,15 +289,17 @@ def chart_cumulative(df, sku):
         cum_demand.append(prev + ss_add + row["forecast_qty"])
 
     # ── Cumulative Supply ──────────────────────────────────────────────────────
-    # Week 1 = oh_start (physical stock available right now)
-    # Each week: on_order receipts arrive and add to running supply total
-    # By end of horizon: total supply = oh_start + total_on_order = ats_w1
-    # This makes the line grow from oh_start to ats_w1 across the horizon
-    cum_supply = []
-    running = oh_start
-    for _ in range(n_weeks):
-        running += weekly_receipt
-        cum_supply.append(round(running, 0))
+    # Week 1 cumulative supply = full ATS (on_hand + on_order already in pipeline)
+    # This is what's available to meet demand RIGHT NOW across the horizon.
+    # on_order_qty is already committed — it arrives within the planning horizon.
+    # Supply grows each week as on_order converts to receipts:
+    #   Week 1: oh_start + weekly_receipt (first batch arrives)
+    #   Week 2: previous + weekly_receipt
+    #   ...until all on_order is received (total = ats_w1 by last week)
+    # But we show CUMULATIVE supply = total supply available through week N,
+    # which starts at ats_w1 (everything already committed) and stays flat
+    # since no new POs can arrive within the lead time horizon.
+    cum_supply = [round(ats_w1, 0)] * n_weeks
 
     # ── Projected Stock Balance ────────────────────────────────────────────────
     # Week-by-week: balance[w] = balance[w-1] + receipt - demand, floored at 0
