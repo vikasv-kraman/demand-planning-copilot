@@ -132,7 +132,12 @@ def generate_forecast_data(seed=42):
             fc = max(0,int(base*season*(1+trend*i)*spike))
             act = max(0,int(fc*noise)) if i<12 else None
             wkly = max(fc/4,1); twoc = np.random.uniform(wlo,whi)
-            oh = max(0,int(wkly*twoc)); oo = int(fc*np.random.uniform(0.4,1.2)) if i>=10 else 0
+            # On Hand: real value for past + current week only
+            # Future weeks (i>12) have on_hand=0 — physically unknowable
+            # i==12 is current week — real on_hand snapshot
+            oh = max(0,int(wkly*twoc)) if i<=12 else 0
+            # On Order: open POs — only relevant for future weeks
+            oo = int(fc*np.random.uniform(0.4,1.2)) if i>=10 else 0
             records.append({"week":week,"sku":s["sku"],"description":s["desc"],"category":s["category"],
                 "supplier":s["supplier"],"lead_time_weeks":s["lead_time"],"safety_stock":s["safety_stock"],
                 "unit_cost":s["unit_cost"],"forecast_qty":fc,"actual_qty":act,"on_hand_qty":oh,"on_order_qty":oo,
@@ -268,16 +273,18 @@ def chart_cumulative(df, sku):
     future = d[d["actual_qty"].isna()].copy().reset_index(drop=True)
     if future.empty: return None
 
-    oh_start    = float(future["on_hand_qty"].iloc[0])
-    on_order_w1 = float(future["on_order_qty"].iloc[0])
-    ats_w1      = oh_start + on_order_w1
-    ss_val      = float(future["safety_stock"].iloc[0]) if "safety_stock" in future.columns else 0
-    lt          = int(d["lead_time_weeks"].iloc[0]) if "lead_time_weeks" in d.columns else 0
-    n_weeks     = len(future)
-    weekly_receipt = on_order_w1 / max(n_weeks, 1)
+    ss_val  = float(future["safety_stock"].iloc[0]) if "safety_stock" in future.columns else 0
+    lt      = int(d["lead_time_weeks"].iloc[0]) if "lead_time_weeks" in d.columns else 0
+    n_weeks = len(future)
+
+    # ── Weekly ATS ─────────────────────────────────────────────────────────────
+    # Week 1 (current): on_hand (real) + on_order = full ATS
+    # Week 2+: on_hand = 0 (future, unknowable) so ATS = on_order only
+    # This is correct because data generator now sets future on_hand = 0
+    future["ats_weekly"] = future["on_hand_qty"] + future["on_order_qty"]
 
     # ── Cumulative Demand ──────────────────────────────────────────────────────
-    # SS added once at week 1 as mandatory floor, then weekly forecast accumulates
+    # SS added once at week 1 as mandatory floor requirement
     cum_demand = []
     for i, (_, row) in enumerate(future.iterrows()):
         ss_add = ss_val if i == 0 else 0
@@ -285,67 +292,61 @@ def chart_cumulative(df, sku):
         cum_demand.append(round(prev + ss_add + row["forecast_qty"], 0))
 
     # ── Cumulative Supply ──────────────────────────────────────────────────────
-    # Starts at oh_start (physical stock now), grows as on_order receipts arrive.
-    # Weekly receipt = on_order_w1 / n_weeks (spread evenly, no arrival schedule)
-    # Final value = oh_start + on_order_w1 = ats_w1
-    cum_supply = []
-    running = oh_start
-    for _ in range(n_weeks):
-        running += weekly_receipt
-        cum_supply.append(round(running, 0))
+    # Running sum of weekly ATS across the horizon
+    # Week 1: oh_start + on_order_w1 (e.g. 95 + 319 = 414)
+    # Week 2: 0 + on_order_w2 (e.g. 0 + 637 = 637) → cumulative = 414 + 637 = 1,051
+    # This correctly reflects increasing PO pipeline across weeks
+    cum_supply = future["ats_weekly"].cumsum().round(0).tolist()
 
     # ── Projected Stock Balance ────────────────────────────────────────────────
+    # Physical stock projection: starts at week1 on_hand, depletes by net demand
+    # Each week: receipts arrive (on_order_qty for that week), demand consumes
     proj_balance = []
-    balance = oh_start
-    for _, row in future.iterrows():
-        balance = max(0, balance + weekly_receipt - row["forecast_qty"])
+    balance = float(future["on_hand_qty"].iloc[0])
+    for i, (_, row) in enumerate(future.iterrows()):
+        # Week 1 on_order already in balance via oh_start; subsequent weeks add new receipts
+        receipt = row["on_order_qty"] if i > 0 else 0
+        balance = max(0, balance + receipt - row["forecast_qty"])
         proj_balance.append(round(balance, 0))
 
     fig = go.Figure()
 
-    # Green fill under supply line first (renders behind other traces)
+    # Green supply line + fill (renders behind)
     fig.add_trace(go.Scatter(
         x=future["week"], y=cum_supply,
-        name=f"Cumul. Supply (OH:{oh_start:.0f} + PO:{on_order_w1:.0f})",
+        name="Cumul. Supply (OH + PO)",
         mode="lines+markers",
-        line=dict(color="#4ade80", width=2.5),
-        marker=dict(size=6),
+        line=dict(color="#4ade80", width=2.5), marker=dict(size=6),
         fill="tozeroy", fillcolor="rgba(74,222,128,0.08)",
         hovertemplate="<b>%{x|%b %d}</b><br>Cum Supply: %{y:,.0f}<extra></extra>"))
 
-    # Red shaded shortfall: area between demand (top) and supply (bottom)
-    # Always draw if demand > supply at ANY point — fill the gap between the two lines
-    if cum_demand[-1] > cum_supply[-1]:
+    # Red shaded gap between demand and supply
+    if any(d > s for d,s in zip(cum_demand, cum_supply)):
         wks = list(future["week"])
         fig.add_trace(go.Scatter(
             x=wks + wks[::-1],
             y=cum_demand + cum_supply[::-1],
-            fill="toself",
-            fillcolor="rgba(248,113,113,0.22)",
-            line=dict(width=0),
-            showlegend=True,
-            name="Supply Shortfall",
-            hoverinfo="skip"))
+            fill="toself", fillcolor="rgba(248,113,113,0.22)",
+            line=dict(width=0), showlegend=True,
+            name="Supply Shortfall", hoverinfo="skip"))
 
-    # Demand line on top (renders above fill)
+    # Red demand line on top
     fig.add_trace(go.Scatter(
         x=future["week"], y=cum_demand,
         name="Cumul. Demand (incl. SS)",
         mode="lines+markers",
-        line=dict(color="#f87171", width=2.5),
-        marker=dict(size=6),
+        line=dict(color="#f87171", width=2.5), marker=dict(size=6),
         hovertemplate="<b>%{x|%b %d}</b><br>Cum Demand: %{y:,.0f}<extra></extra>"))
 
-    # Projected stock balance — blue dotted
+    # Blue dotted projected balance
     fig.add_trace(go.Scatter(
         x=future["week"], y=proj_balance,
         name="Proj. Stock Balance",
         mode="lines+markers",
-        line=dict(color="#60a5fa", width=2, dash="dot"),
-        marker=dict(size=5),
+        line=dict(color="#60a5fa", width=2, dash="dot"), marker=dict(size=5),
         hovertemplate="<b>%{x|%b %d}</b><br>Proj Stock: %{y:,.0f}<extra></extra>"))
 
-    # Safety stock horizontal reference
+    # Safety stock reference
     if ss_val > 0:
         fig.add_hline(y=ss_val, line_dash="dot", line_color="#fbbf24", line_width=1.5)
         fig.add_annotation(
@@ -355,7 +356,7 @@ def chart_cumulative(df, sku):
             showarrow=False, xanchor="left", yanchor="bottom",
             bgcolor="rgba(10,22,40,0.8)", borderpad=3)
 
-    # Lead time vertical marker
+    # Lead time marker
     if lt > 0 and lt <= n_weeks:
         fig.add_vline(
             x=str(future["week"].iloc[min(lt-1, n_weeks-1)]),
