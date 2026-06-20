@@ -504,9 +504,9 @@ def main():
     <div class="app-header">
         <div style="display:flex;align-items:center;gap:16px">
             <img src="data:image/png;base64,{KRAMAN_LOGO_B64}" 
-                 style="height:38px;width:auto;object-fit:contain;" 
+                 style="height:72px;width:auto;object-fit:contain;" 
                  alt="KRAMAN Corp">
-            <div style="width:1px;height:36px;background:#1e3a5f;margin:0 4px;"></div>
+            <div style="width:1px;height:60px;background:#1e3a5f;margin:0 4px;"></div>
             <div>
                 <p class="app-title">AI Demand Planning Copilot</p>
                 <p class="app-subtitle">Industrial & High-Tech Supply Chain Intelligence</p>
