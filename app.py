@@ -231,10 +231,25 @@ def chart_weekly(df, sku):
     fig.add_trace(go.Scatter(x=hist["week"],y=hist["actual_qty"],name="Actual",mode="lines+markers",line=dict(color="#2d9cdb",width=2.5),marker=dict(size=5)))
     if not fcast.empty:
         fig.add_trace(go.Scatter(x=fcast["week"],y=fcast["forecast_qty"],name="Future Forecast",mode="lines+markers",line=dict(color="#fbbf24",width=2,dash="dot"),marker=dict(size=5,symbol="diamond")))
-    fig.add_trace(go.Scatter(x=d["week"],y=d["ats"],name="Avail. to Supply",mode="lines",line=dict(color="#4ade80",width=2),fill="tozeroy",fillcolor="rgba(74,222,128,0.06)"))
+    # On Order — separate line (visible on future weeks when orders exist)
+    on_order_col = pd.to_numeric(d["on_order_qty"], errors="coerce").fillna(0)
+    if on_order_col.sum() > 0:
+        fig.add_trace(go.Scatter(x=d["week"], y=on_order_col,
+            name="On Order", mode="lines+markers",
+            line=dict(color="#a78bfa", width=1.8, dash="dot"),
+            marker=dict(size=4, color="#a78bfa")))
+    # ATS = on_hand + on_order
+    fig.add_trace(go.Scatter(x=d["week"],y=d["ats"],name="Avail. to Supply",mode="lines",
+        line=dict(color="#4ade80",width=2),fill="tozeroy",fillcolor="rgba(74,222,128,0.06)"))
+    # Safety stock line with number label
     ss = d["safety_stock"].iloc[0] if "safety_stock" in d.columns else None
-    if ss: fig.add_hline(y=ss,line_dash="dot",line_color="#f87171",line_width=1.5,annotation_text="Safety Stock",annotation_font_color="#f87171",annotation_font_size=10)
-    fig.update_layout(height=300,margin=dict(l=0,r=0,t=8,b=0),**CHART_LAYOUT)
+    if ss:
+        fig.add_hline(y=ss, line_dash="dot", line_color="#f87171", line_width=1.5)
+        fig.add_annotation(x=d["week"].iloc[-1], y=ss,
+            text=f"  SS: {ss:,.0f}", font=dict(color="#f87171", size=10),
+            showarrow=False, xanchor="left", yanchor="bottom",
+            bgcolor="rgba(10,22,40,0.7)", borderpad=2)
+    fig.update_layout(height=300, margin=dict(l=0,r=80,t=8,b=0), **CHART_LAYOUT)
     return fig
 
 def chart_cumulative(df, sku):
@@ -268,14 +283,15 @@ def chart_cumulative(df, sku):
         cum_demand.append(prev + ss_add + row["forecast_qty"])
 
     # ── Cumulative Supply ──────────────────────────────────────────────────────
-    # Week 1: starts at full ATS (oh + on_order) — matches weekly chart exactly
-    # Each subsequent week: grows by weekly_receipt as POs convert
-    # This ensures week 1 cum_supply == week 1 ATS on weekly chart
+    # Week 1 = oh_start (physical stock available right now)
+    # Each week: on_order receipts arrive and add to running supply total
+    # By end of horizon: total supply = oh_start + total_on_order = ats_w1
+    # This makes the line grow from oh_start to ats_w1 across the horizon
     cum_supply = []
-    running = ats_w1   # ← anchored to ATS, not just oh_start
+    running = oh_start
     for _ in range(n_weeks):
+        running += weekly_receipt
         cum_supply.append(round(running, 0))
-        running = min(running + weekly_receipt, ats_w1)  # supply is bounded by total available
 
     # ── Projected Stock Balance ────────────────────────────────────────────────
     # Week-by-week: balance[w] = balance[w-1] + receipt - demand, floored at 0
@@ -316,15 +332,19 @@ def chart_cumulative(df, sku):
             showarrow=False, xanchor="left", yanchor="bottom",
             bgcolor="rgba(10,22,40,0.8)", borderpad=3)
 
-    # Red shaded gap: where demand exceeds supply
+    # Red shaded gap: fill between cum_demand (top) and cum_supply (bottom)
+    # where demand exceeds supply — shows the actual shortfall zone
     gap_mask = [d > s for d, s in zip(cum_demand, cum_supply)]
     if any(gap_mask):
         wks = list(future["week"])
-        top = [d if m else s for d,s,m in zip(cum_demand,cum_supply,gap_mask)]
-        bot = list(cum_supply)
+        # Top boundary = demand line (only where gap exists, else supply line)
+        top = [d if m else s for d,s,m in zip(cum_demand, cum_supply, gap_mask)]
+        # Bottom boundary = supply line (constant reference)
+        bot = [s for s in cum_supply]
         fig.add_trace(go.Scatter(
-            x=wks + wks[::-1], y=top + bot[::-1],
-            fill="toself", fillcolor="rgba(248,113,113,0.20)",
+            x=wks + wks[::-1],
+            y=top + bot[::-1],
+            fill="toself", fillcolor="rgba(248,113,113,0.25)",
             line=dict(width=0), showlegend=True, name="Supply Shortfall"))
 
     # Lead time vertical marker
