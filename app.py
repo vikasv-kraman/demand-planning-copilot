@@ -291,79 +291,102 @@ def generate_forecast_data(seed=42):
 
 def compute_exceptions(df):
     # ── Ensure derived columns exist (handles uploaded files) ──────────────────
+    df = df.copy()
+    df["actual_qty"]   = pd.to_numeric(df["actual_qty"],   errors="coerce")
+    df["forecast_qty"] = pd.to_numeric(df["forecast_qty"], errors="coerce")
+    df["on_hand_qty"]  = pd.to_numeric(df["on_hand_qty"],  errors="coerce").fillna(0)
+    df["on_order_qty"] = pd.to_numeric(df["on_order_qty"], errors="coerce").fillna(0)
+    df["safety_stock"] = pd.to_numeric(df["safety_stock"], errors="coerce").fillna(0)
+    df["unit_cost"]    = pd.to_numeric(df["unit_cost"],    errors="coerce").fillna(0)
+    df["lead_time_weeks"] = pd.to_numeric(df["lead_time_weeks"], errors="coerce").fillna(0)
+
+    # ATS = on_hand + on_order (true available supply)
+    df["ats"] = df["on_hand_qty"] + df["on_order_qty"]
+
+    # WoC based on ATS — weekly demand = forecast / 4
+    df["ats_woc"] = df.apply(
+        lambda r: round(r["ats"] / max(r["forecast_qty"] / 4, 1), 1), axis=1
+    )
+    # On-hand only WoC — for bare stock awareness
+    df["oh_woc"] = df.apply(
+        lambda r: round(r["on_hand_qty"] / max(r["forecast_qty"] / 4, 1), 1), axis=1
+    )
+
     if "variance_pct" not in df.columns:
         df["variance_pct"] = df.apply(
             lambda r: round(((r["actual_qty"] - r["forecast_qty"]) / max(r["forecast_qty"], 1)) * 100, 1)
-            if pd.notna(r["actual_qty"]) and r["actual_qty"] != "" else None, axis=1
+            if pd.notna(r["actual_qty"]) else None, axis=1
         )
     if "at_risk_value" not in df.columns:
         df["at_risk_value"] = df.apply(
             lambda r: round(max(0, r["safety_stock"] - r["on_hand_qty"]) * r["unit_cost"], 2), axis=1
         )
-    if "projected_woc" not in df.columns:
-        df["projected_woc"] = df.apply(
-            lambda r: round(r["on_hand_qty"] / max(r["forecast_qty"] / 4, 1), 1), axis=1
-        )
 
-    # ── Use most recent future week per SKU; fall back to last actual ──────────
-    future = df[df["actual_qty"].isna() | (df["actual_qty"] == "")]
-    if future.empty:
-        latest_week = df.groupby("sku").last().reset_index()
-    else:
-        latest_week = future.groupby("sku").first().reset_index()
+    # ── Use first future week per SKU; fall back to last row ──────────────────
+    future = df[df["actual_qty"].isna()]
+    latest_week = future.groupby("sku").first().reset_index() if not future.empty \
+                  else df.groupby("sku").last().reset_index()
 
     exceptions = []
 
     for _, row in latest_week.iterrows():
-        issues = []
+        issues   = []
         severity = "Healthy"
 
-        woc = row["projected_woc"]
-        lt  = row["lead_time_weeks"]
-        arv = row["at_risk_value"]
+        ats_woc = row["ats_woc"]   # coverage including open orders
+        oh_woc  = row["oh_woc"]    # bare on-hand only
+        lt      = row["lead_time_weeks"]
+        arv     = row["at_risk_value"]
+        on_order = row["on_order_qty"]
 
-        # ── Stock coverage thresholds ──────────────────────────────────────────
-        if woc < 1.5:
-            issues.append(f"Near stockout — {woc:.1f} weeks of cover")
+        # ── Primary: ATS coverage — what actually matters for supply continuity ─
+        if ats_woc < 1.5:
+            issues.append(f"Critical supply gap — only {ats_woc:.1f}w ATS coverage")
             severity = "Critical"
-        elif woc < 3:
-            issues.append(f"Low stock — {woc:.1f} weeks of cover")
-            severity = "High" if severity not in ["Critical"] else severity
-        elif woc < 5:
-            issues.append(f"Below target — {woc:.1f} weeks of cover")
-            severity = "Medium" if severity == "Healthy" else severity
-
-        # ── Lead time risk — only escalates if stock is already a concern ─────
-        if lt > 30 and severity in ["Critical", "High"]:
-            issues.append(f"Extreme lead time: {lt}w — recovery impossible in-cycle")
-        elif lt > 20 and severity in ["Critical", "High", "Medium"]:
-            issues.append(f"Long lead time: {lt}w — limited recovery window")
-        elif lt > 20 and severity == "Healthy":
-            issues.append(f"Long lead time: {lt}w — monitor proactively")
+        elif ats_woc < 3:
+            issues.append(f"Low supply coverage — {ats_woc:.1f}w ATS")
+            severity = "High"
+        elif ats_woc < 5:
+            issues.append(f"Below target coverage — {ats_woc:.1f}w ATS")
             severity = "Medium"
 
-        # ── Forecast accuracy — only flags if materially bad ─────────────────
-        hist = df[(df["sku"] == row["sku"]) & df["actual_qty"].notna() & (df["actual_qty"] != "")]
+        # ── Secondary: On-hand low but orders cover it — flag as watch item ────
+        if oh_woc < 2 and ats_woc >= 3 and severity == "Healthy":
+            issues.append(f"On-hand low ({oh_woc:.1f}w) — covered by {int(on_order):,} units on order")
+            severity = "Medium"
+        elif oh_woc < 1 and ats_woc >= 3:
+            # Orders cover it but physical stock is nearly zero — still worth noting
+            issues.append(f"Physical stock near zero ({oh_woc:.1f}w) — dependent on inbound orders")
+            if severity == "Healthy": severity = "Medium"
+
+        # ── Lead time risk — only escalates if ATS coverage is already thin ───
+        if lt > 30 and severity in ["Critical", "High"]:
+            issues.append(f"Extreme lead time: {lt}w — no recovery option in-cycle")
+        elif lt > 20 and severity in ["Critical", "High", "Medium"]:
+            issues.append(f"Long lead time: {lt}w — limited reorder window")
+        elif lt > 20 and ats_woc < lt and severity == "Healthy":
+            issues.append(f"Lead time {lt}w exceeds ATS horizon — reorder trigger needed")
+            severity = "Medium"
+
+        # ── Forecast accuracy ──────────────────────────────────────────────────
+        hist = df[(df["sku"] == row["sku"]) & df["actual_qty"].notna()]
         if len(hist) >= 4:
             avg_var = hist["variance_pct"].abs().mean()
             if avg_var > 30 and severity in ["Critical", "High"]:
-                issues.append(f"Severe forecast error: {avg_var:.0f}% avg variance")
-            elif avg_var > 20 and severity == "Medium":
-                issues.append(f"High forecast error: {avg_var:.0f}% avg variance")
-            elif avg_var > 25 and severity == "Healthy":
-                issues.append(f"Forecast accuracy concern: {avg_var:.0f}% avg variance")
-                severity = "Medium"
+                issues.append(f"Severe forecast error: {avg_var:.0f}% avg MAPE")
+            elif avg_var > 25 and severity in ["Medium", "Healthy"]:
+                issues.append(f"Forecast accuracy concern: {avg_var:.0f}% avg MAPE")
+                if severity == "Healthy": severity = "Medium"
 
-        # ── Financial exposure — scaled thresholds ────────────────────────────
+        # ── Financial exposure ─────────────────────────────────────────────────
         if arv > 50000 and severity in ["Critical", "High"]:
-            issues.append(f"${arv:,.0f} inventory at risk")
+            issues.append(f"${arv:,.0f} below safety stock threshold")
         elif arv > 20000 and severity == "Medium":
-            issues.append(f"${arv:,.0f} inventory at risk")
+            issues.append(f"${arv:,.0f} inventory exposure")
         elif arv > 10000 and severity == "Healthy":
             issues.append(f"${arv:,.0f} potential exposure")
             severity = "Medium"
 
-        # ── Only surface if there's an actual issue ───────────────────────────
         if severity != "Healthy" and issues:
             exceptions.append({
                 "sku":          row["sku"],
@@ -372,10 +395,12 @@ def compute_exceptions(df):
                 "supplier":     row["supplier"],
                 "severity":     severity,
                 "issues":       issues,
-                "woc":          woc,
+                "woc":          ats_woc,   # show ATS WoC in table
+                "oh_woc":       oh_woc,
                 "lead_time":    lt,
                 "at_risk_value":arv,
                 "on_hand":      row["on_hand_qty"],
+                "on_order":     on_order,
                 "safety_stock": row["safety_stock"],
                 "forecast":     row["forecast_qty"],
             })
@@ -726,7 +751,7 @@ def main():
             <span>Category</span>
             <span>Severity</span>
             <span>Lead Time</span>
-            <span>Weeks of Cover</span>
+            <span>ATS Cover</span>
             <span>At Risk ($)</span>
         </div>
         """, unsafe_allow_html=True)
