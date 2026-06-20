@@ -247,56 +247,74 @@ def chart_cumulative(df, sku):
     future = d[d["actual_qty"].isna()].copy().reset_index(drop=True)
     if future.empty: return None
 
-    # Starting on-hand = last known on-hand value across all rows
-    oh_start = float(d["on_hand_qty"].iloc[-1])
+    # Use last actual week's on_hand as starting balance
+    actuals = d[d["actual_qty"].notna()]
+    oh_start = float(actuals["on_hand_qty"].iloc[-1]) if not actuals.empty else float(d["on_hand_qty"].iloc[0])
 
-    # Cumulative demand: sum of weekly forecast across forward horizon
+    # on_order_qty is a snapshot per row — use the first future week's value
+    # as total open PO pipeline. Distribute evenly as weekly receipts.
+    total_on_order = float(future["on_order_qty"].iloc[0])
+    n_weeks = len(future)
+    weekly_receipt = total_on_order / max(n_weeks, 1)
+
+    # ── Two series ─────────────────────────────────────────────────────────────
+    # 1. Cumulative Demand — running sum of weekly forecast
+    #    Shows: how much total demand accumulates over the horizon
     cum_demand = future["forecast_qty"].cumsum().tolist()
 
-    # Cumulative ATS:
-    # on_order_qty per row is a SNAPSHOT of total open POs at that week.
-    # We use the first future week's on_order as the total inbound pipeline,
-    # then subtract what arrives each week proportionally.
-    # Simplest correct model: project running balance each week
-    #   balance[w] = balance[w-1] - demand[w] + arrivals[w]
-    # arrivals[w] = change in on_order_qty (orders converting to receipts)
-    # Since we don't have arrival schedules, model as:
-    #   total available = oh_start + total_on_order
-    #   depleted by cumulative demand each week
-    total_on_order = float(future["on_order_qty"].iloc[0])  # snapshot of pipeline
-    total_available = oh_start + total_on_order
-
-    # Week-by-week projected balance (not cumulative — projected inventory level)
+    # 2. Projected Inventory Balance — running on-hand after receipts and demand
+    #    balance[w] = balance[w-1] + weekly_receipt - forecast[w], floored at 0
+    #    Shows: whether you will physically have stock to meet demand week by week
     proj_balance = []
     balance = oh_start
     for _, row in future.iterrows():
-        # Receive a proportional share of on_order this week
-        weekly_receipt = total_on_order / max(len(future), 1)
         balance = max(0, balance + weekly_receipt - row["forecast_qty"])
-        proj_balance.append(balance)
+        proj_balance.append(round(balance, 0))
 
-    # Cumulative supply available = total_available - nothing consumed yet
-    # Express as: how much cumulative demand can total supply cover
-    cum_ats = [min(total_available, cd) for cd in cum_demand]
-    # After total supply is exhausted, ATS flatlines
-    running_total = total_available
-    cum_ats_correct = []
-    for fc in future["forecast_qty"].tolist():
-        running_total = max(0, running_total - fc)
-        cum_ats_correct.append(total_available - running_total)
+    # ── Cumulative ATS ─────────────────────────────────────────────────────────
+    # Express as cumulative supply available = cumulative receipts + starting oh
+    # This makes both lines comparable on the same scale
+    cum_supply = []
+    running_supply = oh_start
+    for _, row in future.iterrows():
+        running_supply += weekly_receipt   # inbound receipts accumulate
+        cum_supply.append(round(running_supply, 0))
 
-    cum_ats = cum_ats_correct
+    # The gap: where cumulative demand exceeds cumulative supply = shortfall
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=future["week"],y=cum_demand,name="Cumulative Demand",mode="lines+markers",line=dict(color="#f87171",width=2.5),marker=dict(size=6)))
-    fig.add_trace(go.Scatter(x=future["week"],y=cum_ats,name="Cumulative ATS",mode="lines+markers",line=dict(color="#4ade80",width=2.5),marker=dict(size=6),fill="tozeroy",fillcolor="rgba(74,222,128,0.07)"))
-    # Gap fill where demand > ATS
-    gap_y_upper = [max(d,a) for d,a in zip(cum_demand,cum_ats)]
-    gap_y_lower = [min(d,a) for d,a in zip(cum_demand,cum_ats)]
-    gap_mask = [d>a for d,a in zip(cum_demand,cum_ats)]
+    # Cumulative demand — red, shows total demand building up
+    fig.add_trace(go.Scatter(x=future["week"], y=cum_demand,
+        name="Cumul. Demand", mode="lines+markers",
+        line=dict(color="#f87171", width=2.5), marker=dict(size=6)))
+
+    # Cumulative supply — green, shows total inbound supply building up
+    fig.add_trace(go.Scatter(x=future["week"], y=cum_supply,
+        name="Cumul. Supply (OH+Orders)", mode="lines+markers",
+        line=dict(color="#4ade80", width=2.5), marker=dict(size=6),
+        fill="tozeroy", fillcolor="rgba(74,222,128,0.06)"))
+
+    # Projected inventory balance — blue dotted, shows week-by-week stock level
+    fig.add_trace(go.Scatter(x=future["week"], y=proj_balance,
+        name="Projected Stock", mode="lines+markers",
+        line=dict(color="#60a5fa", width=2, dash="dot"), marker=dict(size=5)))
+
+    # Safety stock reference
+    ss_val = float(d["safety_stock"].iloc[0]) if "safety_stock" in d.columns else None
+    if ss_val:
+        fig.add_hline(y=ss_val, line_dash="dot", line_color="#f87171",
+            line_width=1.2, annotation_text="Safety Stock",
+            annotation_font_color="#f87171", annotation_font_size=10)
+
+    # Red shaded gap where cumulative demand exceeds cumulative supply
+    gap_mask = [dem > sup for dem, sup in zip(cum_demand, cum_supply)]
     if any(gap_mask):
-        fig.add_trace(go.Scatter(x=list(future["week"])+list(future["week"])[::-1],
-            y=[d if m else a for d,a,m in zip(cum_demand,cum_ats,gap_mask)]+[a if m else a for d,a,m in zip(cum_demand,cum_ats,gap_mask)][::-1],
-            fill="toself",fillcolor="rgba(248,113,113,0.15)",line=dict(width=0),showlegend=False,name="Supply Gap"))
+        weeks_list = list(future["week"])
+        fig.add_trace(go.Scatter(
+            x=weeks_list + weeks_list[::-1],
+            y=[dem if m else sup for dem,sup,m in zip(cum_demand,cum_supply,gap_mask)] +
+              [sup if m else sup for dem,sup,m in zip(cum_demand,cum_supply,gap_mask)][::-1],
+            fill="toself", fillcolor="rgba(248,113,113,0.18)",
+            line=dict(width=0), showlegend=False, name="Supply Shortfall"))
     lt = int(d["lead_time_weeks"].iloc[0]) if "lead_time_weeks" in d.columns else 0
     if lt>0 and lt<=len(future):
         fig.add_vline(x=str(future["week"].iloc[min(lt-1,len(future)-1)]),line_dash="dot",line_color="#fbbf24",line_width=1.5,annotation_text=f"Lead Time ({lt}w)",annotation_font_color="#fbbf24",annotation_font_size=10)
