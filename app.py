@@ -139,8 +139,8 @@ st.markdown("""
 
 # ── Sample data generator ─────────────────────────────────────────────────────
 @st.cache_data
-def generate_forecast_data():
-    np.random.seed(42)
+def generate_forecast_data(seed=42):
+    np.random.seed(seed)
     weeks = pd.date_range(start=datetime.now() - timedelta(weeks=12), periods=16, freq='W')
     
     skus = [
@@ -336,15 +336,18 @@ Be specific. Name the SKUs. Give concrete actions like "Issue PO for X units of 
 Exception data:
 {exc_summary_text}
 
-Identify and rank the top 5 risks across:
-- Supply continuity (single source, long lead times, geopolitical)
-- Demand volatility (forecast accuracy, customer concentration)
-- Financial exposure (inventory value at risk, write-off potential)
-- Operational (capacity, quality, supplier financial health)
+Identify and rank the top 5 risks. For each risk use EXACTLY this plain text format with no markdown, no asterisks, no bold, no hyphens as bullets:
 
-For each risk: Name | Probability (H/M/L) | Impact (H/M/L) | Mitigation
+RISK 1 - [Risk Name]
+SKU: [SKU code] | Supplier: [Supplier] | Severity: [Critical/High/Medium]
+Probability: [HIGH/MEDIUM/LOW] | Impact: [HIGH/MEDIUM/LOW]
+Analysis: [2-3 sentence analysis of the risk and financial exposure]
+Mitigation: [Specific concrete action with timeline]
 
-Be specific to the data. Reference actual SKUs and suppliers."""
+RISK 2 - [Risk Name]
+[same format]
+
+Continue to RISK 5. Be specific. Reference actual SKU codes and supplier names. No markdown formatting whatsoever."""
         )
 
     return outputs
@@ -450,9 +453,12 @@ def main():
         st.session_state.df = None
         st.session_state.exceptions = []
         st.session_state.ai_outputs = {}
+        st.session_state.demo_seed = 42
 
     if use_demo:
-        st.session_state.df = generate_forecast_data()
+        seed = st.session_state.get("demo_seed", 42)
+        st.session_state.demo_seed = seed + np.random.randint(1, 5)
+        st.session_state.df = generate_forecast_data(seed)
         st.session_state.exceptions = compute_exceptions(st.session_state.df)
         st.session_state.ai_outputs = {}
         st.success("✅ Demo data generated — 8 SKUs across 16 weeks, Industrial High-Tech vertical")
@@ -605,12 +611,66 @@ def main():
                     """, unsafe_allow_html=True)
                 
                 with tab4:
-                    st.markdown(f"""
-                    <div class="ai-block">
-                        <div class="ai-block-title">Supply Chain Risk Register</div>
-                        <div style="font-size:0.87rem;line-height:1.75;color:#1e293b;white-space:pre-wrap">{st.session_state.ai_outputs.get('risk', '')}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    risk_text = st.session_state.ai_outputs.get('risk', '')
+                    severity_colors = {"CRITICAL": "#dc2626", "HIGH": "#d97706", "MEDIUM": "#2563eb", "LOW": "#16a34a"}
+                    prob_colors = {"HIGH": "#fee2e2", "MEDIUM": "#fef3c7", "LOW": "#dcfce7"}
+                    prob_text = {"HIGH": "#991b1b", "MEDIUM": "#92400e", "LOW": "#166534"}
+                    
+                    import re
+                    risk_blocks = re.split(r'RISK\s+\d+\s*[-—]', risk_text)
+                    risk_blocks = [b.strip() for b in risk_blocks if b.strip()]
+                    
+                    st.markdown('<div class="ai-block-title" style="font-size:0.75rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:12px">Supply Chain Risk Register</div>', unsafe_allow_html=True)
+                    
+                    for idx, block in enumerate(risk_blocks):
+                        lines = [l.strip() for l in block.strip().split('\n') if l.strip()]
+                        if not lines:
+                            continue
+                        
+                        title = lines[0]
+                        meta = lines[1] if len(lines) > 1 else ""
+                        prob_line = lines[2] if len(lines) > 2 else ""
+                        body_lines = lines[3:] if len(lines) > 3 else []
+                        body = " ".join(body_lines)
+                        
+                        prob = "MEDIUM"
+                        impact = "MEDIUM"
+                        pm = re.search(r'Probability:\s*(HIGH|MEDIUM|LOW)', prob_line, re.IGNORECASE)
+                        im = re.search(r'Impact:\s*(HIGH|MEDIUM|LOW)', prob_line, re.IGNORECASE)
+                        if pm: prob = pm.group(1).upper()
+                        if im: impact = im.group(1).upper()
+                        
+                        border_color = "#dc2626" if prob == "HIGH" and impact == "HIGH" else "#d97706" if prob == "HIGH" or impact == "HIGH" else "#2563eb"
+                        pbg = prob_colors.get(prob, "#fef3c7")
+                        ptx = prob_text.get(prob, "#92400e")
+                        ibg = prob_colors.get(impact, "#fef3c7")
+                        itx = prob_text.get(impact, "#92400e")
+                        
+                        mitigation = ""
+                        analysis = ""
+                        for line in body_lines:
+                            if line.startswith("Mitigation:"):
+                                mitigation = line.replace("Mitigation:", "").strip()
+                            elif line.startswith("Analysis:"):
+                                analysis = line.replace("Analysis:", "").strip()
+                            elif not analysis:
+                                analysis += " " + line
+                        
+                        st.markdown(f"""
+                        <div style="background:white;border:0.5px solid var(--color-border-tertiary);border-left:3px solid {border_color};border-radius:var(--border-radius-lg);padding:1rem 1.25rem;margin-bottom:10px">
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+                                <span style="font-size:0.7rem;font-weight:700;color:#94a3b8">RISK {idx+1}</span>
+                                <span style="font-size:0.87rem;font-weight:600;color:#0f172a">{title}</span>
+                            </div>
+                            <div style="font-size:0.75rem;color:#64748b;margin-bottom:8px">{meta}</div>
+                            <div style="display:flex;gap:8px;margin-bottom:10px">
+                                <span style="background:{pbg};color:{ptx};font-size:0.68rem;font-weight:600;padding:2px 10px;border-radius:20px">Prob: {prob}</span>
+                                <span style="background:{ibg};color:{itx};font-size:0.68rem;font-weight:600;padding:2px 10px;border-radius:20px">Impact: {impact}</span>
+                            </div>
+                            <p style="font-size:0.82rem;color:#334155;line-height:1.6;margin:0 0 8px">{analysis.strip()}</p>
+                            {f'<div style="background:#f8fafc;border-radius:6px;padding:8px 12px;font-size:0.8rem;color:#0f4c81;line-height:1.5"><strong>Mitigation:</strong> {mitigation}</div>' if mitigation else ''}
+                        </div>
+                        """, unsafe_allow_html=True)
 
         # Export
         st.markdown('<p class="section-header">Export</p>', unsafe_allow_html=True)
