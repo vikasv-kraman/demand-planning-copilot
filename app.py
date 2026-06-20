@@ -295,9 +295,10 @@ def chart_exec_donut(exceptions, df):
         textinfo="percent+label",
         textfont=dict(size=11, color="#fff"),
         hovertemplate="<b>%{label}</b><br>%{customdata}<extra></extra>"))
-    fig.update_layout(height=280, margin=dict(l=0,r=0,t=8,b=8),
+    fig.update_layout(height=320, margin=dict(l=10,r=10,t=16,b=40),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        showlegend=False,
+        showlegend=True,
+        legend=dict(orientation="h", y=-0.18, font=dict(size=11,color="#8ab4d4"), bgcolor="rgba(0,0,0,0)"),
         annotations=[dict(
             text=f"<b>${total_arv:,.0f}</b><br><span style=\'font-size:11px\'>Total at Risk</span>",
             x=0.5, y=0.5, font_size=14, font_color="#fff", showarrow=False)])
@@ -513,15 +514,28 @@ def main():
                 st.markdown('<p class="section-header">Exception SKUs</p>', unsafe_allow_html=True)
                 if st.session_state.selected_sku is None:
                     st.session_state.selected_sku = exceptions[0]["sku"]
+                sku_options = [e["sku"] for e in exceptions]
+                sku_labels  = {e["sku"]: e for e in exceptions}
+                def _select_sku(sku):
+                    st.session_state.selected_sku = sku
                 for e in exceptions:
                     is_sel = e["sku"]==st.session_state.selected_sku
                     bc=sev_colors.get(e["severity"],"badge-blue")
                     woc=e["woc"]; wc="#f87171" if woc<1.5 else "#fbbf24" if woc<3 else "#4ade80"
-                    if st.button(f"{e['sku']}",key=f"sku_btn_{e['sku']}",use_container_width=True,
-                        type="primary" if is_sel else "secondary"):
-                        st.session_state.selected_sku=e["sku"]; st.rerun()
-                    sev_line=f"<span class='badge {bc}'>{e['severity']}</span> &nbsp; <span style='color:{wc};font-size:.75rem;font-weight:600'>{woc:.1f}w ATS</span>"
-                    st.markdown(f"<div style='margin-top:-8px;margin-bottom:8px;padding:0 4px'>{sev_line}</div>",unsafe_allow_html=True)
+                    border = "#1a6fd4" if is_sel else "#1e3a5f"
+                    bg = "#1a3050" if is_sel else "#0d1f3c"
+                    st.markdown(f"""<div style="background:{bg};border:1px solid {border};border-radius:8px;
+                        padding:8px 12px;margin-bottom:6px;cursor:pointer">
+                        <div style="font-size:.82rem;font-weight:600;color:#fff">{e["sku"]}</div>
+                        <div style="margin-top:4px">
+                            <span class="badge {bc}">{e["severity"]}</span>
+                            &nbsp;<span style="color:{wc};font-size:.73rem;font-weight:600">{woc:.1f}w ATS</span>
+                        </div>
+                    </div>""", unsafe_allow_html=True)
+                    # Invisible button overlay — no rerun, just state update
+                    if st.button(f"▶ {e['sku']}",key=f"sku_btn_{e['sku']}",use_container_width=True):
+                        st.session_state.selected_sku=e["sku"]
+                    st.markdown("<style>div[data-testid='stButton'] button:has(div){margin-top:-52px;opacity:0;height:52px}</style>",unsafe_allow_html=True)
 
             with pc_right:
                 sel = st.session_state.selected_sku
@@ -561,10 +575,25 @@ def main():
                         else:
                             st.markdown('<p style="color:#4a7fa5;padding:1rem">No future forecast weeks available for this SKU.</p>',unsafe_allow_html=True)
 
-                    # Severity map for context
-                    st.markdown('<p class="section-header">Exception Severity Map</p>', unsafe_allow_html=True)
-                    smap = chart_severity_map(exceptions)
-                    if smap: st.plotly_chart(smap,use_container_width=True,config={"displayModeBar":False})
+                    # Severity map — clickable bars
+                    st.markdown('<p class="section-header">Exception Severity Map — click to select</p>', unsafe_allow_html=True)
+                    smap_cols = st.columns(len(exceptions))
+                    sev_clr = {"Critical":"#f87171","High":"#fbbf24","Medium":"#60a5fa"}
+                    for idx_e, (col_e, e_item) in enumerate(zip(smap_cols, exceptions)):
+                        with col_e:
+                            is_s = e_item["sku"]==st.session_state.selected_sku
+                            bar_h = 60 if not is_s else 80
+                            clr = sev_clr.get(e_item["severity"],"#60a5fa")
+                            opacity = "1.0" if is_s else "0.5"
+                            st.markdown(f"""<div style="text-align:center;cursor:pointer">
+                                <div style="background:{clr};opacity:{opacity};border-radius:4px 4px 0 0;
+                                    height:{bar_h}px;transition:all .2s;margin:0 2px"></div>
+                                <div style="font-size:.6rem;color:#8ab4d4;margin-top:3px;
+                                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{e_item["sku"].split("-")[0]}</div>
+                            </div>""", unsafe_allow_html=True)
+                            if st.button(e_item["sku"], key=f"smap_btn_{e_item['sku']}_{idx_e}", use_container_width=True):
+                                st.session_state.selected_sku = e_item["sku"]
+                            st.markdown("<style>div[data-testid='stButton'] button{margin-top:-20px;opacity:0;height:20px}</style>", unsafe_allow_html=True)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TAB 3 — AI ANALYSIS
