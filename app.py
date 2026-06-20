@@ -512,7 +512,7 @@ def main():
                 <p class="app-subtitle">Industrial & High-Tech Supply Chain Intelligence</p>
             </div>
         </div>
-        <div class="powered-badge">Powered by Claude AI &nbsp;·&nbsp; KRAMAN Corp</div>
+        <div class="powered-badge">Analytics powered by Claude AI &nbsp;·&nbsp; KRAMAN Corp</div>
     </div>
     """, unsafe_allow_html=True)
 
