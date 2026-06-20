@@ -264,26 +264,43 @@ def chart_cumulative(df, sku):
     lt = int(d["lead_time_weeks"].iloc[0]) if "lead_time_weeks" in d.columns else 0
     if lt>0 and lt<=len(future):
         fig.add_vline(x=str(future["week"].iloc[min(lt-1,len(future)-1)]),line_dash="dot",line_color="#fbbf24",line_width=1.5,annotation_text=f"Lead Time ({lt}w)",annotation_font_color="#fbbf24",annotation_font_size=10)
-    fig.update_layout(height=300,margin=dict(l=0,r=0,t=8,b=0),**CHART_LAYOUT,
-        xaxis=dict(showgrid=False,tickfont=dict(size=11,color="#8ab4d4"),linecolor="#1e3a5f",title=dict(text="Forward Weeks",font=dict(color="#4a7fa5",size=11))))
+    fig.update_layout(height=300, margin=dict(l=0,r=0,t=8,b=0),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter,sans-serif", color="#8ab4d4"),
+        legend=dict(orientation="h", y=-0.28, font=dict(size=11,color="#8ab4d4"), bgcolor="rgba(0,0,0,0)"),
+        xaxis=dict(showgrid=False, tickfont=dict(size=11,color="#8ab4d4"), linecolor="#1e3a5f",
+                   title=dict(text="Forward Weeks", font=dict(color="#4a7fa5",size=11))),
+        yaxis=dict(gridcolor="#1a3050", gridwidth=0.5, tickfont=dict(size=11,color="#8ab4d4"), linecolor="#1e3a5f"),
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="#0d1f3c", bordercolor="#1e3a5f", font=dict(color="#fff",size=12)))
     return fig
 
 def chart_exec_donut(exceptions, df):
-    sev_counts = {"Critical":0,"High":0,"Medium":0,"Healthy":0}
-    exc_skus = {e["sku"] for e in exceptions}
     total = df["sku"].nunique()
-    for e in exceptions: sev_counts[e["severity"]] = sev_counts.get(e["severity"],0)+1
+    sev_counts = {"Critical":0,"High":0,"Medium":0,"Healthy":0}
+    sev_value  = {"Critical":0.0,"High":0.0,"Medium":0.0,"Healthy":0.0}
+    for e in exceptions:
+        sev_counts[e["severity"]] = sev_counts.get(e["severity"],0) + 1
+        sev_value[e["severity"]]  = sev_value.get(e["severity"],0.0) + e["at_risk_value"]
     sev_counts["Healthy"] = total - sum(v for k,v in sev_counts.items() if k!="Healthy")
     labels=list(sev_counts.keys()); values=list(sev_counts.values())
     colors={"Critical":"#f87171","High":"#fbbf24","Medium":"#60a5fa","Healthy":"#4ade80"}
-    fig = go.Figure(go.Pie(labels=labels,values=values,hole=0.62,
-        marker=dict(colors=[colors[l] for l in labels],line=dict(color="#0a1628",width=2)),
-        textinfo="percent",textfont=dict(size=12,color="#fff"),
-        hovertemplate="%{label}: %{value} SKUs<extra></extra>"))
-    fig.update_layout(height=260,margin=dict(l=0,r=0,t=8,b=0),
-        paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h",y=-0.12,font=dict(size=11,color="#8ab4d4"),bgcolor="rgba(0,0,0,0)"),
-        annotations=[dict(text=f"<b>{total}</b><br>SKUs",x=0.5,y=0.5,font_size=16,font_color="#fff",showarrow=False)])
+    total_arv = sum(e["at_risk_value"] for e in exceptions)
+    custom = [f"{sev_counts[l]} SKUs<br>${sev_value.get(l,0):,.0f} at risk" if l!="Healthy"
+              else f"{sev_counts[l]} SKUs<br>Within targets" for l in labels]
+    fig = go.Figure(go.Pie(labels=labels, values=values, hole=0.62,
+        marker=dict(colors=[colors[l] for l in labels], line=dict(color="#0a1628",width=2)),
+        text=[f"{v}" for v in values],
+        customdata=custom,
+        textinfo="percent+label",
+        textfont=dict(size=11, color="#fff"),
+        hovertemplate="<b>%{label}</b><br>%{customdata}<extra></extra>"))
+    fig.update_layout(height=280, margin=dict(l=0,r=0,t=8,b=8),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        annotations=[dict(
+            text=f"<b>${total_arv:,.0f}</b><br><span style=\'font-size:11px\'>Total at Risk</span>",
+            x=0.5, y=0.5, font_size=14, font_color="#fff", showarrow=False)])
     return fig
 
 def chart_exec_bar(exceptions):
