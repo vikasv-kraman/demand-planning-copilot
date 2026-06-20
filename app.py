@@ -239,17 +239,53 @@ def chart_weekly(df, sku):
 
 def chart_cumulative(df, sku):
     d = df[df["sku"]==sku].sort_values("week").copy()
-    for c in ["forecast_qty","on_hand_qty","on_order_qty"]:
-        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
-    future = d[d["actual_qty"].isna()].copy()
+    for c in ["forecast_qty","on_hand_qty","on_order_qty","actual_qty"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["on_hand_qty"]  = d["on_hand_qty"].fillna(0)
+    d["on_order_qty"] = d["on_order_qty"].fillna(0)
+
+    future = d[d["actual_qty"].isna()].copy().reset_index(drop=True)
     if future.empty: return None
-    future = future.reset_index(drop=True)
-    oh_start = d["on_hand_qty"].iloc[-1] if not d.empty else 0
-    cum_demand=[]; cum_ats=[]; running_oh=oh_start
-    for _,row in future.iterrows():
-        cum_demand.append(cum_demand[-1]+row["forecast_qty"] if cum_demand else row["forecast_qty"])
-        running_oh = max(0, running_oh - row["forecast_qty"] + row["on_order_qty"])
-        cum_ats.append(cum_ats[-1] + row["on_order_qty"] if cum_ats else oh_start + row["on_order_qty"])
+
+    # Starting on-hand = last known on-hand value across all rows
+    oh_start = float(d["on_hand_qty"].iloc[-1])
+
+    # Cumulative demand: sum of weekly forecast across forward horizon
+    cum_demand = future["forecast_qty"].cumsum().tolist()
+
+    # Cumulative ATS:
+    # on_order_qty per row is a SNAPSHOT of total open POs at that week.
+    # We use the first future week's on_order as the total inbound pipeline,
+    # then subtract what arrives each week proportionally.
+    # Simplest correct model: project running balance each week
+    #   balance[w] = balance[w-1] - demand[w] + arrivals[w]
+    # arrivals[w] = change in on_order_qty (orders converting to receipts)
+    # Since we don't have arrival schedules, model as:
+    #   total available = oh_start + total_on_order
+    #   depleted by cumulative demand each week
+    total_on_order = float(future["on_order_qty"].iloc[0])  # snapshot of pipeline
+    total_available = oh_start + total_on_order
+
+    # Week-by-week projected balance (not cumulative — projected inventory level)
+    proj_balance = []
+    balance = oh_start
+    for _, row in future.iterrows():
+        # Receive a proportional share of on_order this week
+        weekly_receipt = total_on_order / max(len(future), 1)
+        balance = max(0, balance + weekly_receipt - row["forecast_qty"])
+        proj_balance.append(balance)
+
+    # Cumulative supply available = total_available - nothing consumed yet
+    # Express as: how much cumulative demand can total supply cover
+    cum_ats = [min(total_available, cd) for cd in cum_demand]
+    # After total supply is exhausted, ATS flatlines
+    running_total = total_available
+    cum_ats_correct = []
+    for fc in future["forecast_qty"].tolist():
+        running_total = max(0, running_total - fc)
+        cum_ats_correct.append(total_available - running_total)
+
+    cum_ats = cum_ats_correct
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=future["week"],y=cum_demand,name="Cumulative Demand",mode="lines+markers",line=dict(color="#f87171",width=2.5),marker=dict(size=6)))
     fig.add_trace(go.Scatter(x=future["week"],y=cum_ats,name="Cumulative ATS",mode="lines+markers",line=dict(color="#4ade80",width=2.5),marker=dict(size=6),fill="tozeroy",fillcolor="rgba(74,222,128,0.07)"))
@@ -514,28 +550,32 @@ def main():
                 st.markdown('<p class="section-header">Exception SKUs</p>', unsafe_allow_html=True)
                 if st.session_state.selected_sku is None:
                     st.session_state.selected_sku = exceptions[0]["sku"]
-                sku_options = [e["sku"] for e in exceptions]
-                sku_labels  = {e["sku"]: e for e in exceptions}
-                def _select_sku(sku):
-                    st.session_state.selected_sku = sku
-                for e in exceptions:
-                    is_sel = e["sku"]==st.session_state.selected_sku
-                    bc=sev_colors.get(e["severity"],"badge-blue")
-                    woc=e["woc"]; wc="#f87171" if woc<1.5 else "#fbbf24" if woc<3 else "#4ade80"
-                    border = "#1a6fd4" if is_sel else "#1e3a5f"
-                    bg = "#1a3050" if is_sel else "#0d1f3c"
-                    st.markdown(f"""<div style="background:{bg};border:1px solid {border};border-radius:8px;
-                        padding:8px 12px;margin-bottom:6px;cursor:pointer">
-                        <div style="font-size:.82rem;font-weight:600;color:#fff">{e["sku"]}</div>
-                        <div style="margin-top:4px">
-                            <span class="badge {bc}">{e["severity"]}</span>
-                            &nbsp;<span style="color:{wc};font-size:.73rem;font-weight:600">{woc:.1f}w ATS</span>
-                        </div>
-                    </div>""", unsafe_allow_html=True)
-                    # Invisible button overlay — no rerun, just state update
-                    if st.button(f"▶ {e['sku']}",key=f"sku_btn_{e['sku']}",use_container_width=True):
-                        st.session_state.selected_sku=e["sku"]
-                    st.markdown("<style>div[data-testid='stButton'] button:has(div){margin-top:-52px;opacity:0;height:52px}</style>",unsafe_allow_html=True)
+                # Build format labels with severity and ATS
+                sev_clr_map = {"Critical":"🔴","High":"🟡","Medium":"🔵"}
+                radio_opts = [e["sku"] for e in exceptions]
+                radio_labels = {e["sku"]: f"{sev_clr_map.get(e['severity'],'⚪')} {e['sku']} · {e['woc']:.1f}w" for e in exceptions}
+                # Use index to control selection
+                cur_idx = radio_opts.index(st.session_state.selected_sku) if st.session_state.selected_sku in radio_opts else 0
+                # Custom styled radio via selectbox styled minimally
+                st.markdown("""<style>
+                    div[data-testid="stRadio"] label {
+                        background:#0d1f3c;border:1px solid #1e3a5f;border-radius:8px;
+                        padding:8px 12px;margin-bottom:4px;display:block;
+                        font-size:.81rem;cursor:pointer;color:#fff;
+                    }
+                    div[data-testid="stRadio"] label:hover {background:#112244;border-color:#1a6fd4}
+                    div[data-testid="stRadio"] [data-testid="stMarkdownContainer"] p {margin:0}
+                    div[data-testid="stRadio"] [aria-checked="true"] + div label,
+                    div[data-testid="stRadio"] input:checked ~ label {background:#1a3050;border-color:#1a6fd4}
+                </style>""", unsafe_allow_html=True)
+                selected = st.radio("",
+                    options=radio_opts,
+                    format_func=lambda x: radio_labels.get(x, x),
+                    index=cur_idx,
+                    key="sku_radio",
+                    label_visibility="collapsed")
+                if selected != st.session_state.selected_sku:
+                    st.session_state.selected_sku = selected
 
             with pc_right:
                 sel = st.session_state.selected_sku
@@ -575,25 +615,11 @@ def main():
                         else:
                             st.markdown('<p style="color:#4a7fa5;padding:1rem">No future forecast weeks available for this SKU.</p>',unsafe_allow_html=True)
 
-                    # Severity map — clickable bars
-                    st.markdown('<p class="section-header">Exception Severity Map — click to select</p>', unsafe_allow_html=True)
-                    smap_cols = st.columns(len(exceptions))
+                    # Severity map — visual bars, selection driven by radio above
+                    st.markdown('<p class="section-header">Exception Severity Map</p>', unsafe_allow_html=True)
                     sev_clr = {"Critical":"#f87171","High":"#fbbf24","Medium":"#60a5fa"}
-                    for idx_e, (col_e, e_item) in enumerate(zip(smap_cols, exceptions)):
-                        with col_e:
-                            is_s = e_item["sku"]==st.session_state.selected_sku
-                            bar_h = 60 if not is_s else 80
-                            clr = sev_clr.get(e_item["severity"],"#60a5fa")
-                            opacity = "1.0" if is_s else "0.5"
-                            st.markdown(f"""<div style="text-align:center;cursor:pointer">
-                                <div style="background:{clr};opacity:{opacity};border-radius:4px 4px 0 0;
-                                    height:{bar_h}px;transition:all .2s;margin:0 2px"></div>
-                                <div style="font-size:.6rem;color:#8ab4d4;margin-top:3px;
-                                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{e_item["sku"].split("-")[0]}</div>
-                            </div>""", unsafe_allow_html=True)
-                            if st.button(e_item["sku"], key=f"smap_btn_{e_item['sku']}_{idx_e}", use_container_width=True):
-                                st.session_state.selected_sku = e_item["sku"]
-                            st.markdown("<style>div[data-testid='stButton'] button{margin-top:-20px;opacity:0;height:20px}</style>", unsafe_allow_html=True)
+                    smap = chart_severity_map(exceptions)
+                    if smap: st.plotly_chart(smap, use_container_width=True, config={"displayModeBar":False})
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TAB 3 — AI ANALYSIS
