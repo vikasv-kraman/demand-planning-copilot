@@ -247,86 +247,109 @@ def chart_cumulative(df, sku):
     future = d[d["actual_qty"].isna()].copy().reset_index(drop=True)
     if future.empty: return None
 
-    # Use last actual week's on_hand as starting balance
-    actuals = d[d["actual_qty"].notna()]
-    oh_start = float(actuals["on_hand_qty"].iloc[-1]) if not actuals.empty else float(d["on_hand_qty"].iloc[0])
-
-    # on_order_qty is a snapshot per row — use the first future week's value
-    # as total open PO pipeline. Distribute evenly as weekly receipts.
+    # ── Anchor to first future week position ───────────────────────────────────
+    oh_start       = float(future["on_hand_qty"].iloc[0])
     total_on_order = float(future["on_order_qty"].iloc[0])
-    n_weeks = len(future)
+    ss_val         = float(future["safety_stock"].iloc[0]) if "safety_stock" in future.columns else 0
+    n_weeks        = len(future)
     weekly_receipt = total_on_order / max(n_weeks, 1)
 
-    # ── Two series ─────────────────────────────────────────────────────────────
-    # 1. Cumulative Demand — running sum of weekly forecast
-    #    Shows: how much total demand accumulates over the horizon
-    cum_demand = future["forecast_qty"].cumsum().tolist()
+    # ── Cumulative Demand ──────────────────────────────────────────────────────
+    # SS is added ONCE at week 1 as a mandatory floor requirement,
+    # then weekly forecast accumulates on top each subsequent week.
+    # This reflects how MRP/ERP systems treat SS — as demand to be fulfilled
+    # before regular demand can be serviced.
+    cum_demand = []
+    for i, (_, row) in enumerate(future.iterrows()):
+        base = ss_val if i == 0 else 0   # SS added only in week 1
+        prev = cum_demand[-1] if cum_demand else 0
+        cum_demand.append(prev + base + row["forecast_qty"])
 
-    # 2. Projected Inventory Balance — running on-hand after receipts and demand
-    #    balance[w] = balance[w-1] + weekly_receipt - forecast[w], floored at 0
-    #    Shows: whether you will physically have stock to meet demand week by week
+    # ── Cumulative Supply ──────────────────────────────────────────────────────
+    # Starts at oh_start, grows by weekly receipt as POs convert to stock
+    cum_supply = []
+    running = oh_start
+    for _ in range(n_weeks):
+        running += weekly_receipt
+        cum_supply.append(round(running, 0))
+
+    # ── Projected Stock Balance ────────────────────────────────────────────────
+    # Week-by-week on-hand after receipts minus demand, floored at 0
     proj_balance = []
     balance = oh_start
     for _, row in future.iterrows():
         balance = max(0, balance + weekly_receipt - row["forecast_qty"])
         proj_balance.append(round(balance, 0))
 
-    # ── Cumulative ATS ─────────────────────────────────────────────────────────
-    # Express as cumulative supply available = cumulative receipts + starting oh
-    # This makes both lines comparable on the same scale
-    cum_supply = []
-    running_supply = oh_start
-    for _, row in future.iterrows():
-        running_supply += weekly_receipt   # inbound receipts accumulate
-        cum_supply.append(round(running_supply, 0))
-
-    # The gap: where cumulative demand exceeds cumulative supply = shortfall
     fig = go.Figure()
-    # Cumulative demand — red, shows total demand building up
+
+    # Cumulative demand — red (includes SS in week 1)
     fig.add_trace(go.Scatter(x=future["week"], y=cum_demand,
-        name="Cumul. Demand", mode="lines+markers",
-        line=dict(color="#f87171", width=2.5), marker=dict(size=6)))
+        name="Cumul. Demand (incl. SS)", mode="lines+markers",
+        line=dict(color="#f87171", width=2.5), marker=dict(size=6),
+        hovertemplate="<b>%{x|%b %d}</b><br>Cum Demand: %{y:,.0f}<extra></extra>"))
 
-    # Cumulative supply — green, shows total inbound supply building up
+    # Cumulative supply — green
     fig.add_trace(go.Scatter(x=future["week"], y=cum_supply,
-        name="Cumul. Supply (OH+Orders)", mode="lines+markers",
+        name="Cumul. Supply (OH+PO)", mode="lines+markers",
         line=dict(color="#4ade80", width=2.5), marker=dict(size=6),
-        fill="tozeroy", fillcolor="rgba(74,222,128,0.06)"))
+        fill="tozeroy", fillcolor="rgba(74,222,128,0.06)",
+        hovertemplate="<b>%{x|%b %d}</b><br>Cum Supply: %{y:,.0f}<extra></extra>"))
 
-    # Projected inventory balance — blue dotted, shows week-by-week stock level
+    # Projected stock balance — blue dotted
     fig.add_trace(go.Scatter(x=future["week"], y=proj_balance,
-        name="Projected Stock", mode="lines+markers",
-        line=dict(color="#60a5fa", width=2, dash="dot"), marker=dict(size=5)))
+        name="Proj. Stock Balance", mode="lines+markers",
+        line=dict(color="#60a5fa", width=2, dash="dot"), marker=dict(size=5),
+        hovertemplate="<b>%{x|%b %d}</b><br>Proj Stock: %{y:,.0f}<extra></extra>"))
 
-    # Safety stock reference
-    ss_val = float(d["safety_stock"].iloc[0]) if "safety_stock" in d.columns else None
-    if ss_val:
-        fig.add_hline(y=ss_val, line_dash="dot", line_color="#f87171",
-            line_width=1.2, annotation_text="Safety Stock",
-            annotation_font_color="#f87171", annotation_font_size=10)
+    # Safety stock line with explicit label showing the number
+    if ss_val > 0:
+        fig.add_hline(y=ss_val, line_dash="dot", line_color="#fbbf24", line_width=1.5)
+        # Add annotation separately so we can control position precisely
+        fig.add_annotation(
+            x=future["week"].iloc[-1],
+            y=ss_val,
+            text=f"  Safety Stock: {ss_val:,.0f}",
+            font=dict(color="#fbbf24", size=11),
+            showarrow=False,
+            xanchor="left",
+            yanchor="bottom",
+            bgcolor="rgba(10,22,40,0.7)",
+            borderpad=3)
 
-    # Red shaded gap where cumulative demand exceeds cumulative supply
-    gap_mask = [dem > sup for dem, sup in zip(cum_demand, cum_supply)]
+    # Red shaded gap: cumulative demand > cumulative supply
+    gap_mask = [d > s for d, s in zip(cum_demand, cum_supply)]
     if any(gap_mask):
-        weeks_list = list(future["week"])
+        wks = list(future["week"])
+        top = [d if m else s for d,s,m in zip(cum_demand,cum_supply,gap_mask)]
+        bot = list(cum_supply)
         fig.add_trace(go.Scatter(
-            x=weeks_list + weeks_list[::-1],
-            y=[dem if m else sup for dem,sup,m in zip(cum_demand,cum_supply,gap_mask)] +
-              [sup if m else sup for dem,sup,m in zip(cum_demand,cum_supply,gap_mask)][::-1],
-            fill="toself", fillcolor="rgba(248,113,113,0.18)",
-            line=dict(width=0), showlegend=False, name="Supply Shortfall"))
+            x=wks + wks[::-1], y=top + bot[::-1],
+            fill="toself", fillcolor="rgba(248,113,113,0.20)",
+            line=dict(width=0), showlegend=True, name="Supply Shortfall"))
+
+    # Lead time marker
     lt = int(d["lead_time_weeks"].iloc[0]) if "lead_time_weeks" in d.columns else 0
-    if lt>0 and lt<=len(future):
-        fig.add_vline(x=str(future["week"].iloc[min(lt-1,len(future)-1)]),line_dash="dot",line_color="#fbbf24",line_width=1.5,annotation_text=f"Lead Time ({lt}w)",annotation_font_color="#fbbf24",annotation_font_size=10)
-    fig.update_layout(height=300, margin=dict(l=0,r=0,t=8,b=0),
+    if lt > 0 and lt <= n_weeks:
+        fig.add_vline(
+            x=str(future["week"].iloc[min(lt-1, n_weeks-1)]),
+            line_dash="dot", line_color="#fbbf24", line_width=1.5,
+            annotation_text=f"Lead Time ({lt}w)",
+            annotation_font_color="#fbbf24", annotation_font_size=10)
+
+    fig.update_layout(height=320, margin=dict(l=0, r=120, t=8, b=0),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Inter,sans-serif", color="#8ab4d4"),
-        legend=dict(orientation="h", y=-0.28, font=dict(size=11,color="#8ab4d4"), bgcolor="rgba(0,0,0,0)"),
-        xaxis=dict(showgrid=False, tickfont=dict(size=11,color="#8ab4d4"), linecolor="#1e3a5f",
+        legend=dict(orientation="h", y=-0.28, font=dict(size=11,color="#8ab4d4"),
+                    bgcolor="rgba(0,0,0,0)"),
+        xaxis=dict(showgrid=False, tickfont=dict(size=11,color="#8ab4d4"),
+                   linecolor="#1e3a5f",
                    title=dict(text="Forward Weeks", font=dict(color="#4a7fa5",size=11))),
-        yaxis=dict(gridcolor="#1a3050", gridwidth=0.5, tickfont=dict(size=11,color="#8ab4d4"), linecolor="#1e3a5f"),
+        yaxis=dict(gridcolor="#1a3050", gridwidth=0.5,
+                   tickfont=dict(size=11,color="#8ab4d4"), linecolor="#1e3a5f"),
         hovermode="x unified",
-        hoverlabel=dict(bgcolor="#0d1f3c", bordercolor="#1e3a5f", font=dict(color="#fff",size=12)))
+        hoverlabel=dict(bgcolor="#0d1f3c", bordercolor="#1e3a5f",
+                        font=dict(color="#fff",size=12)))
     return fig
 
 def chart_exec_donut(exceptions, df):
