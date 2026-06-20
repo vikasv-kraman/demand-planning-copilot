@@ -114,7 +114,7 @@ st.markdown("""
 
     /* ── Exception table ── */
     .exc-row {
-        display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr;
+        display: grid; grid-template-columns: 2fr 1fr 1fr 0.7fr 0.8fr 1fr;
         gap: 12px; padding: 10px 0; border-bottom: 1px solid #1a3050;
         align-items: center; font-size: 0.85rem;
     }
@@ -408,7 +408,7 @@ def generate_all_outputs(df, exceptions):
     
     skus_summary = df.groupby("sku").agg({
         "description": "first", "category": "first", "forecast_qty": "mean",
-        "variance_pct": "mean", "projected_woc": "mean"
+        "projected_woc": "mean"
     }).round(1).to_string()
 
     outputs = {}
@@ -492,27 +492,70 @@ Continue to RISK 5. Be specific. Reference actual SKU codes and supplier names. 
 # ── Charts ────────────────────────────────────────────────────────────────────
 def chart_forecast_vs_actual(df, sku):
     sku_df = df[df["sku"] == sku].sort_values("week")
-    hist = sku_df[sku_df["actual_qty"].notna()]
+
+    # Ensure numeric
+    sku_df = sku_df.copy()
+    sku_df["actual_qty"]   = pd.to_numeric(sku_df["actual_qty"],   errors="coerce")
+    sku_df["forecast_qty"] = pd.to_numeric(sku_df["forecast_qty"], errors="coerce")
+    sku_df["on_hand_qty"]  = pd.to_numeric(sku_df["on_hand_qty"],  errors="coerce")
+    sku_df["on_order_qty"] = pd.to_numeric(sku_df["on_order_qty"], errors="coerce")
+
+    # ATS = on_hand + on_order (available to supply)
+    sku_df["ats"] = sku_df["on_hand_qty"].fillna(0) + sku_df["on_order_qty"].fillna(0)
+
+    hist  = sku_df[sku_df["actual_qty"].notna()]
     fcast = sku_df[sku_df["actual_qty"].isna()]
-    
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=hist["week"], y=hist["actual_qty"],
-        name="Actual", line=dict(color="#0f4c81", width=2.5), mode="lines+markers",
-        marker=dict(size=6)))
-    fig.add_trace(go.Scatter(x=sku_df["week"], y=sku_df["forecast_qty"],
-        name="Forecast", line=dict(color="#94a3b8", width=2, dash="dash"), mode="lines"))
+
+    # Forecast (full horizon — dashed)
+    fig.add_trace(go.Scatter(
+        x=sku_df["week"], y=sku_df["forecast_qty"],
+        name="Forecast", mode="lines",
+        line=dict(color="#4a7fa5", width=2, dash="dash")))
+
+    # Actual (past only — solid bright)
+    fig.add_trace(go.Scatter(
+        x=hist["week"], y=hist["actual_qty"],
+        name="Actual", mode="lines+markers",
+        line=dict(color="#2d9cdb", width=2.5),
+        marker=dict(size=5, color="#2d9cdb")))
+
+    # Future forecast (forward period — amber)
     if not fcast.empty:
-        fig.add_trace(go.Scatter(x=fcast["week"], y=fcast["forecast_qty"],
-            name="Future Forecast", line=dict(color="#f59e0b", width=2.5), mode="lines+markers",
-            marker=dict(size=6, symbol="diamond")))
-    
+        fig.add_trace(go.Scatter(
+            x=fcast["week"], y=fcast["forecast_qty"],
+            name="Future Forecast", mode="lines+markers",
+            line=dict(color="#fbbf24", width=2, dash="dot"),
+            marker=dict(size=5, symbol="diamond", color="#fbbf24")))
+
+    # ATS — Available to Supply (on_hand + on_order) — green
+    fig.add_trace(go.Scatter(
+        x=sku_df["week"], y=sku_df["ats"],
+        name="Avail. to Supply", mode="lines",
+        line=dict(color="#4ade80", width=2),
+        fill="tozeroy", fillcolor="rgba(74,222,128,0.06)"))
+
+    # Safety stock reference line
+    ss_val = sku_df["safety_stock"].iloc[0] if "safety_stock" in sku_df.columns else None
+    if ss_val:
+        fig.add_hline(y=ss_val, line_dash="dot", line_color="#f87171",
+                      line_width=1.5, annotation_text="Safety Stock",
+                      annotation_font_color="#f87171", annotation_font_size=10)
+
     fig.update_layout(
-        height=260, margin=dict(l=0, r=0, t=8, b=0),
+        height=300, margin=dict(l=0, r=0, t=8, b=0),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", y=-0.25, font=dict(size=11)),
-        xaxis=dict(showgrid=False, tickfont=dict(size=11)),
-        yaxis=dict(gridcolor="#f1f5f9", tickfont=dict(size=11)),
-        font=dict(family="Inter, sans-serif")
+        legend=dict(orientation="h", y=-0.28, font=dict(size=11, color="#8ab4d4"),
+                    bgcolor="rgba(0,0,0,0)"),
+        xaxis=dict(showgrid=False, tickfont=dict(size=11, color="#8ab4d4"),
+                   linecolor="#1e3a5f"),
+        yaxis=dict(gridcolor="#1a3050", gridwidth=0.5,
+                   tickfont=dict(size=11, color="#8ab4d4"), linecolor="#1e3a5f"),
+        font=dict(family="Inter, sans-serif", color="#8ab4d4"),
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="#0d1f3c", bordercolor="#1e3a5f",
+                        font=dict(color="#ffffff", size=12))
     )
     return fig
 
@@ -682,6 +725,7 @@ def main():
             <span>SKU / Description</span>
             <span>Category</span>
             <span>Severity</span>
+            <span>Lead Time</span>
             <span>Weeks of Cover</span>
             <span>At Risk ($)</span>
         </div>
@@ -690,17 +734,21 @@ def main():
         for e in exceptions:
             badge_class = severity_colors.get(e["severity"], "badge-blue")
             issues_text = " · ".join(e["issues"][:2])
+            lt = e["lead_time"]
+            lt_color = "#f87171" if lt > 30 else "#fbbf24" if lt > 16 else "#4ade80"
+            woc_color = "#f87171" if e["woc"] < 1.5 else "#fbbf24" if e["woc"] < 3 else "#4ade80"
             st.markdown(f"""
-            <div class="exc-row">
+            <div class="exc-row" style="grid-template-columns: 2fr 1fr 1fr 0.7fr 0.8fr 1fr;">
                 <span>
-                    <strong style="font-size:0.85rem">{e['sku']}</strong><br>
+                    <strong style="font-size:0.85rem;color:#ffffff">{e['sku']}</strong><br>
                     <span style="font-size:0.75rem;color:#8ab4d4">{e['description']}</span><br>
                     <span style="font-size:0.72rem;color:#4a7fa5">{issues_text}</span>
                 </span>
                 <span style="font-size:0.82rem;color:#8ab4d4">{e['category']}</span>
                 <span><span class="badge {badge_class}">{e['severity']}</span></span>
-                <span style="font-size:0.9rem;font-weight:600;color:{'#dc2626' if e['woc'] < 2 else '#d97706' if e['woc'] < 4 else '#16a34a'}">{e['woc']:.1f}w</span>
-                <span style="font-size:0.85rem;font-weight:600">${e['at_risk_value']:,.0f}</span>
+                <span style="font-size:0.88rem;font-weight:600;color:{lt_color}">{lt}w</span>
+                <span style="font-size:0.88rem;font-weight:600;color:{woc_color}">{e['woc']:.1f}w</span>
+                <span style="font-size:0.85rem;font-weight:600;color:#ffffff">${e['at_risk_value']:,.0f}</span>
             </div>
             """, unsafe_allow_html=True)
 
