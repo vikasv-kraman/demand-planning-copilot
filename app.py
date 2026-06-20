@@ -290,52 +290,96 @@ def generate_forecast_data(seed=42):
 
 
 def compute_exceptions(df):
-    latest_week = df[df["actual_qty"].isna()].groupby("sku").first().reset_index()
+    # ── Ensure derived columns exist (handles uploaded files) ──────────────────
+    if "variance_pct" not in df.columns:
+        df["variance_pct"] = df.apply(
+            lambda r: round(((r["actual_qty"] - r["forecast_qty"]) / max(r["forecast_qty"], 1)) * 100, 1)
+            if pd.notna(r["actual_qty"]) and r["actual_qty"] != "" else None, axis=1
+        )
+    if "at_risk_value" not in df.columns:
+        df["at_risk_value"] = df.apply(
+            lambda r: round(max(0, r["safety_stock"] - r["on_hand_qty"]) * r["unit_cost"], 2), axis=1
+        )
+    if "projected_woc" not in df.columns:
+        df["projected_woc"] = df.apply(
+            lambda r: round(r["on_hand_qty"] / max(r["forecast_qty"] / 4, 1), 1), axis=1
+        )
+
+    # ── Use most recent future week per SKU; fall back to last actual ──────────
+    future = df[df["actual_qty"].isna() | (df["actual_qty"] == "")]
+    if future.empty:
+        latest_week = df.groupby("sku").last().reset_index()
+    else:
+        latest_week = future.groupby("sku").first().reset_index()
+
     exceptions = []
-    
+
     for _, row in latest_week.iterrows():
         issues = []
-        severity = "Low"
-        
+        severity = "Healthy"
+
         woc = row["projected_woc"]
-        if woc < 2:
-            issues.append(f"Critical stock — {woc:.1f} weeks of cover")
+        lt  = row["lead_time_weeks"]
+        arv = row["at_risk_value"]
+
+        # ── Stock coverage thresholds ──────────────────────────────────────────
+        if woc < 1.5:
+            issues.append(f"Near stockout — {woc:.1f} weeks of cover")
             severity = "Critical"
-        elif woc < 4:
+        elif woc < 3:
             issues.append(f"Low stock — {woc:.1f} weeks of cover")
-            severity = "High" if severity != "Critical" else severity
+            severity = "High" if severity not in ["Critical"] else severity
+        elif woc < 5:
+            issues.append(f"Below target — {woc:.1f} weeks of cover")
+            severity = "Medium" if severity == "Healthy" else severity
 
-        if row["lead_time_weeks"] > 20:
-            issues.append(f"Long lead time: {row['lead_time_weeks']}w")
-            severity = "High" if severity == "Low" else severity
+        # ── Lead time risk — only escalates if stock is already a concern ─────
+        if lt > 30 and severity in ["Critical", "High"]:
+            issues.append(f"Extreme lead time: {lt}w — recovery impossible in-cycle")
+        elif lt > 20 and severity in ["Critical", "High", "Medium"]:
+            issues.append(f"Long lead time: {lt}w — limited recovery window")
+        elif lt > 20 and severity == "Healthy":
+            issues.append(f"Long lead time: {lt}w — monitor proactively")
+            severity = "Medium"
 
-        hist = df[(df["sku"] == row["sku"]) & (df["actual_qty"].notna())]
-        if len(hist) > 3:
+        # ── Forecast accuracy — only flags if materially bad ─────────────────
+        hist = df[(df["sku"] == row["sku"]) & df["actual_qty"].notna() & (df["actual_qty"] != "")]
+        if len(hist) >= 4:
             avg_var = hist["variance_pct"].abs().mean()
-            if avg_var > 20:
+            if avg_var > 30 and severity in ["Critical", "High"]:
+                issues.append(f"Severe forecast error: {avg_var:.0f}% avg variance")
+            elif avg_var > 20 and severity == "Medium":
                 issues.append(f"High forecast error: {avg_var:.0f}% avg variance")
-                severity = "High" if severity == "Low" else severity
-        
-        if row["at_risk_value"] > 5000:
-            issues.append(f"${row['at_risk_value']:,.0f} inventory at risk")
-            severity = "Critical" if row["at_risk_value"] > 15000 else ("High" if severity == "Low" else severity)
-        
-        if issues:
+            elif avg_var > 25 and severity == "Healthy":
+                issues.append(f"Forecast accuracy concern: {avg_var:.0f}% avg variance")
+                severity = "Medium"
+
+        # ── Financial exposure — scaled thresholds ────────────────────────────
+        if arv > 50000 and severity in ["Critical", "High"]:
+            issues.append(f"${arv:,.0f} inventory at risk")
+        elif arv > 20000 and severity == "Medium":
+            issues.append(f"${arv:,.0f} inventory at risk")
+        elif arv > 10000 and severity == "Healthy":
+            issues.append(f"${arv:,.0f} potential exposure")
+            severity = "Medium"
+
+        # ── Only surface if there's an actual issue ───────────────────────────
+        if severity != "Healthy" and issues:
             exceptions.append({
-                "sku": row["sku"],
-                "description": row["description"],
-                "category": row["category"],
-                "supplier": row["supplier"],
-                "severity": severity,
-                "issues": issues,
-                "woc": woc,
-                "lead_time": row["lead_time_weeks"],
-                "at_risk_value": row["at_risk_value"],
-                "on_hand": row["on_hand_qty"],
+                "sku":          row["sku"],
+                "description":  row["description"],
+                "category":     row["category"],
+                "supplier":     row["supplier"],
+                "severity":     severity,
+                "issues":       issues,
+                "woc":          woc,
+                "lead_time":    lt,
+                "at_risk_value":arv,
+                "on_hand":      row["on_hand_qty"],
                 "safety_stock": row["safety_stock"],
-                "forecast": row["forecast_qty"],
+                "forecast":     row["forecast_qty"],
             })
-    
+
     severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
     return sorted(exceptions, key=lambda x: severity_order.get(x["severity"], 4))
 
@@ -583,8 +627,11 @@ def main():
         high_count = sum(1 for e in exceptions if e["severity"] == "High")
         total_at_risk = sum(e["at_risk_value"] for e in exceptions)
         
-        hist_df = df[df["actual_qty"].notna()]
-        avg_accuracy = 100 - hist_df["variance_pct"].abs().mean() if not hist_df.empty else 0
+        hist_df = df[df["actual_qty"].notna() & (df["actual_qty"] != "")]
+        if "variance_pct" in df.columns and not hist_df.empty:
+            avg_accuracy = round(100 - hist_df["variance_pct"].abs().mean(), 1)
+        else:
+            avg_accuracy = 0
 
         st.markdown(f"""
         <div class="metric-grid">
